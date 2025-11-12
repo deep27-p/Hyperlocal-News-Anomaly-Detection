@@ -17,7 +17,7 @@ st.set_page_config(
 @st.cache_data
 def load_data():
     # Changed path from local Windows absolute path to a GitHub-relative path
-    path = "notebooks/outputs/processed_news.csv" 
+    path = "notebook/models/ouput/processed_news.csv" 
     
     df = pd.read_csv(path)
     df.columns = df.columns.str.strip()
