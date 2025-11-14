@@ -1,10 +1,102 @@
+# streamlit_app.py (optimized)
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import random
 from datetime import datetime
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-from geotext import GeoText
+import re
+
+# Lazy/cached imports for heavy libs
+@st.cache_resource
+def get_sentiment_analyzer():
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    return SentimentIntensityAnalyzer()
+
+@st.cache_resource
+def get_geotext():
+    # Return the GeoText constructor so we can call in runtime without re-importing
+    from geotext import GeoText
+    return GeoText
+
+@st.cache_resource
+def build_category_vectorizer_and_matrix():
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    # Expanded categories (same as you requested)
+    categories = {
+        "Politics": [
+            "election", "vote", "minister", "government", "policy", "parliament",
+            "senate", "assembly", "cabinet", "bill", "law", "democracy",
+            "opposition", "campaign", "political party", "mp", "mla", "governor",
+            "president", "pm", "chief minister", "government scheme", "public sector",
+            "budget", "ordinance", "diplomacy", "international relations"
+        ],
+        "Education": [
+            "school", "college", "university", "education", "students",
+            "teacher", "principal", "examination", "result", "admission",
+            "scholarship", "online classes", "syllabus", "textbook", "learning",
+            "training program", "board exam", "academic", "research paper",
+            "classroom", "attendance", "hostel", "campus", "lab", "coaching",
+            "education policy", "skill development"
+        ],
+        "Health": [
+            "health", "hospital", "doctor", "nurse", "patient", "disease",
+            "virus", "infection", "vaccine", "clinic", "treatment", "surgery",
+            "medicine", "healthcare", "diagnosis", "ambulance", "emergency",
+            "mental health", "covid", "fever", "flu", "health department",
+            "medical research", "public health", "health scheme"
+        ],
+        "Environment": [
+            "environment", "pollution", "climate", "climate change", "global warming",
+            "rainfall", "flood", "drought", "forest", "wildlife", "animals",
+            "air quality", "water quality", "recycling", "waste management",
+            "solar energy", "renewable energy", "disaster", "cyclone", "heatwave",
+            "ozone", "ecosystem", "deforestation", "conservation"
+        ],
+        "Crime": [
+            "crime", "police", "robbery", "murder", "theft", "fraud", "assault",
+            "kidnap", "cybercrime", "accident", "victim", "court", "arrest",
+            "investigation", "violence", "scam", "illegal", "narcotics",
+            "juvenile", "forensic", "criminal", "fir", "chargesheet",
+            "smuggling", "terrorism", "extortion"
+        ],
+        "Business": [
+            "market", "stock", "company", "investment", "profit", "loss",
+            "economy", "finance", "business", "industry", "startup", "shares",
+            "ipo", "merger", "acquisition", "ceo", "revenue", "sales",
+            "trade", "export", "import", "banking", "inflation", "commerce",
+            "manufacturing", "small business", "corporate"
+        ],
+        "Technology": [
+            "technology", "tech", "digital", "ai", "artificial intelligence",
+            "machine learning", "deep learning", "neural network",
+            "automation", "algorithm", "software", "app", "mobile", "computer",
+            "robotics", "device", "smartphone", "innovation", "hardware",
+            "processor", "chipset", "wearable", "semiconductor", "cloud",
+            "cloud computing", "server", "data center", "database", "big data",
+            "cyber", "cybersecurity", "data breach", "malware", "ransomware",
+            "phishing", "encryption", "firewall", "iot", "5g", "network",
+            "connectivity", "electric vehicle", "autonomous car",
+            "self-driving", "startup", "research", "prototype", "engineering"
+        ],
+        "Sports": [
+            "sports", "match", "game", "tournament", "league", "world cup",
+            "team", "player", "stadium", "score", "goal", "cricket", "football",
+            "basketball", "tennis", "badminton", "athlete", "coach",
+            "championship", "training", "medal", "olympics", "injury",
+            "referee", "umpire", "sports event"
+        ],
+        "General": [
+            "public", "local", "event", "people", "society", "community",
+            "festival", "celebration", "traffic", "weather", "update",
+            "announcement", "information", "general news", "daily update"
+        ]
+    }
+    docs = [" ".join(v) for v in categories.values()]
+    vectorizer = TfidfVectorizer(stop_words="english")
+    tfidf_matrix = vectorizer.fit_transform(docs)
+    # we return the vectorizer, tfidf_matrix and category list for fast similarity checks
+    return vectorizer, tfidf_matrix, list(categories.keys()), categories
 
 # ==========================
 # PAGE CONFIG
@@ -16,21 +108,46 @@ st.set_page_config(
 )
 
 # ==========================
-# DATA LOADING
+# DATA LOADING (cached)
 # ==========================
 @st.cache_data
-def load_data():
-    path = r"C:\Users\sowmi\OneDrive\Desktop\python\final project\notebooks\outputs\processed_news.csv"
-  # ✅ fixed typo from ouput → output
-    df = pd.read_csv(path)
-    df.columns = df.columns.str.strip()
-    df["AnomalyFlag"] = df["AnomalyFlag"].astype(str).str.strip().fillna("Normal")
-    df["Anomaly_Flag"] = df["AnomalyFlag"].apply(
-        lambda x: 1 if str(x).lower() in ["1", "anomaly", "true", "yes"] else 0
-    )
-    return df
+def load_data(path):
+    try:
+        df_local = pd.read_csv(path)
+    except Exception as e:
+        # try without raw path if running on remote (spaces)
+        st.warning(f"Could not read CSV at {path}. Error: {e}")
+        df_local = pd.DataFrame()
+    if not df_local.empty:
+        df_local.columns = df_local.columns.str.strip()
+        if "AnomalyFlag" in df_local.columns:
+            df_local["AnomalyFlag"] = df_local["AnomalyFlag"].astype(str).str.strip().fillna("Normal")
+            df_local["Anomaly_Flag"] = df_local["AnomalyFlag"].apply(
+                lambda x: 1 if str(x).lower() in ["1", "anomaly", "true", "yes"] else 0
+            )
+        else:
+            df_local["Anomaly_Flag"] = 0
+    return df_local
 
-df = load_data()
+# NOTE: change this path when deploying (use relative path or put processed_news.csv in repo)
+DATA_PATH = r"C:\Users\sowmi\OneDrive\Desktop\python\final project\notebooks\outputs\processed_news.csv"
+df = load_data(DATA_PATH)
+
+# Prebuild cached resources
+sentiment_analyzer = get_sentiment_analyzer()
+GeoText = get_geotext()
+vectorizer, category_tfidf_matrix, category_names, CATEGORY_KEYWORDS = build_category_vectorizer_and_matrix()
+
+# trusted locations list (cached as a simple module-level constant)
+TRUSTED_LOCATIONS = [
+    "Mumbai", "Delhi", "Bengaluru", "Chennai", "Kolkata",
+    "Hyderabad", "Pune", "Jaipur", "Ahmedabad", "Lucknow",
+    "Bhopal", "Chandigarh", "Patna", "Thiruvananthapuram",
+    "Assam", "Kerala", "Gujarat", "Rajasthan", "Tamil Nadu",
+    "Maharashtra", "Karnataka", "Uttar Pradesh", "Bihar",
+    "Pakistan", "Bangladesh", "Nepal", "Sri Lanka", "Bhutan",
+    "New York", "London", "Paris", "Tokyo", "Sydney"
+]
 
 # ==========================
 # SIDEBAR NAVIGATION
@@ -46,7 +163,7 @@ tabs = st.sidebar.radio(
         "Read Articles",
         "Anomalous Articles",
         "Normal Articles",
-        "User Input Prediction"  # ✅ new feature
+        "User Input Prediction"
     ]
 )
 
@@ -55,7 +172,6 @@ tabs = st.sidebar.radio(
 # ==========================
 if tabs == "Project Overview":
     st.title("🧠 Hyperlocal News Anomaly Detection and Source Attribution")
-
     st.markdown("""
     ### 🎯 Objective
     Detect anomalous or misleading patterns in hyperlocal news by comparing linguistic, sentiment, and location-based cues using advanced NLP models such as BERT and RoBERTa.
@@ -72,9 +188,6 @@ if tabs == "Project Overview":
     3. **Anomaly Detection:** Apply Isolation Forest / Autoencoders.  
     4. **Source Attribution:** Predict most likely origin location using BERT classifier.  
     5. **Visualization:** Interactive Streamlit dashboard with anomaly summaries, sentiment charts, and article reading section.
-
-    ### 🧰 Technologies Used
-    Python, scikit-learn, TensorFlow, PyTorch, Transformers (BERT/RoBERTa), Pandas, Plotly, Streamlit, AWS/GCP Hosting
     """)
 
 # ==========================
@@ -82,94 +195,97 @@ if tabs == "Project Overview":
 # ==========================
 elif tabs == "Data Overview":
     st.title("📈 Data Overview")
+    if df.empty:
+        st.info("No data loaded. Please check DATA_PATH or upload processed_news.csv in the app folder.")
+    else:
+        total_anomalies = int(df["Anomaly_Flag"].sum())
+        total_normal = int(len(df) - total_anomalies)
+        anomaly_percent = (total_anomalies / len(df)) * 100 if len(df) > 0 else 0
 
-    total_anomalies = df["Anomaly_Flag"].sum()
-    total_normal = len(df) - total_anomalies
-    anomaly_percent = (total_anomalies / len(df)) * 100
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("⚠️ Total Anomalies", total_anomalies)
+        with col2:
+            st.metric("📰 Normal Articles", total_normal)
+        with col3:
+            st.metric("📊 Anomaly Percentage", f"{anomaly_percent:.2f}%")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("⚠️ Total Anomalies", total_anomalies)
-    with col2:
-        st.metric("📰 Normal Articles", total_normal)
-    with col3:
-        st.metric("📊 Anomaly Percentage", f"{anomaly_percent:.2f}%")
+        st.markdown("### 📂 Data Sample")
+        st.dataframe(df.head(10))
 
-    st.markdown("### 📂 Data Sample")
-    st.dataframe(df.head(10))
-
-    st.markdown("### 🧾 Dataset Columns Description")
-    st.write("""
-    - **Heading:** News headline  
-    - **Article:** Full news content  
-    - **Date:** Publication date  
-    - **NewsType:** Category of news  
-    - **Sentiment:** Computed polarity  
-    - **AnomalyFlag:** Indicates if flagged as anomaly  
-    - **Predicted_Location_BERT:** BERT-predicted region  
-    - **anomaly_score:** Numeric anomaly score  
-    """)
+        st.markdown("### 🧾 Dataset Columns Description")
+        st.write("""
+        - **Heading:** News headline  
+        - **Article:** Full news content  
+        - **Date:** Publication date  
+        - **NewsType:** Category of news  
+        - **Sentiment:** Computed polarity  
+        - **AnomalyFlag:** Indicates if flagged as anomaly  
+        - **Predicted_Location_BERT:** BERT-predicted region  
+        - **anomaly_score:** Numeric anomaly score  
+        """)
 
 # ==========================
 # TAB 3 - VISUAL INSIGHTS
 # ==========================
 elif tabs == "Visual Insights":
     st.title("📊 Visual Insights & Analytics")
+    if df.empty:
+        st.info("No data available for visual insights.")
+    else:
+        # --- Anomaly vs Normal ---
+        st.subheader("1️⃣ Anomaly vs Normal Distribution")
+        counts = df["Anomaly_Flag"].value_counts().rename({0: "Normal", 1: "Anomaly"}).reset_index()
+        counts.columns = ["Type", "Count"]
 
-    # --- Anomaly vs Normal ---
-    st.subheader("1️⃣ Anomaly vs Normal Distribution")
-    counts = df["Anomaly_Flag"].value_counts().rename({0: "Normal", 1: "Anomaly"}).reset_index()
-    counts.columns = ["Type", "Count"]
+        col1, col2 = st.columns(2)
+        with col1:
+            bar_fig = px.bar(counts, x="Type", y="Count", color="Type", title="Anomaly vs Normal (Bar Chart)")
+            st.plotly_chart(bar_fig, use_container_width=True)
+        with col2:
+            pie_fig = px.pie(counts, names="Type", values="Count", title="Anomaly vs Normal (Pie Chart)")
+            st.plotly_chart(pie_fig, use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        bar_fig = px.bar(counts, x="Type", y="Count", color="Type", title="Anomaly vs Normal (Bar Chart)")
-        st.plotly_chart(bar_fig, use_container_width=True)
-    with col2:
-        pie_fig = px.pie(counts, names="Type", values="Count", title="Anomaly vs Normal (Pie Chart)")
-        st.plotly_chart(pie_fig, use_container_width=True)
+        # --- Sentiment Distribution ---
+        st.subheader("2️⃣ Sentiment Distribution")
+        if "Sentiment" in df.columns:
+            sentiment_df = df["Sentiment"].value_counts().reset_index()
+            sentiment_df.columns = ["Sentiment", "Count"]
+            sentiment_fig = px.bar(
+                sentiment_df,
+                x="Sentiment",
+                y="Count",
+                color="Sentiment",
+                title="Sentiment Distribution",
+            )
+            st.plotly_chart(sentiment_fig, use_container_width=True)
 
-    # --- Sentiment Distribution ---
-    st.subheader("2️⃣ Sentiment Distribution")
-    if "Sentiment" in df.columns:
-        sentiment_df = df["Sentiment"].value_counts().reset_index()
-        sentiment_df.columns = ["Sentiment", "Count"]
-        sentiment_fig = px.bar(
-            sentiment_df,
-            x="Sentiment",
-            y="Count",
-            color="Sentiment",
-            title="Sentiment Distribution",
-        )
-        st.plotly_chart(sentiment_fig, use_container_width=True)
+        # --- Top News Types ---
+        st.subheader("3️⃣ Top News Types")
+        if "NewsType" in df.columns:
+            type_df = df["NewsType"].value_counts().reset_index().head(10)
+            type_df.columns = ["NewsType", "Count"]
+            type_fig = px.bar(type_df, x="NewsType", y="Count", color="NewsType", title="Top 10 News Types")
+            st.plotly_chart(type_fig, use_container_width=True)
 
-    # --- Top News Types ---
-    st.subheader("3️⃣ Top News Types")
-    if "NewsType" in df.columns:
-        type_df = df["NewsType"].value_counts().reset_index().head(10)
-        type_df.columns = ["NewsType", "Count"]
-        type_fig = px.bar(type_df, x="NewsType", y="Count", color="NewsType", title="Top 10 News Types")
-        st.plotly_chart(type_fig, use_container_width=True)
-
-    # --- Top Locations ---
-    st.subheader("4️⃣ Top 10 Predicted Locations (BERT)")
-    if "Predicted_Location_BERT" in df.columns:
-        loc_df = df["Predicted_Location_BERT"].value_counts().reset_index().head(10)
-        loc_df.columns = ["Location", "Count"]
-        loc_fig = px.bar(loc_df, x="Location", y="Count", color="Location", title="Top 10 Predicted Locations")
-        st.plotly_chart(loc_fig, use_container_width=True)
+        # --- Top Locations ---
+        st.subheader("4️⃣ Top 10 Predicted Locations (BERT)")
+        if "Predicted_Location_BERT" in df.columns:
+            loc_df = df["Predicted_Location_BERT"].value_counts().reset_index().head(10)
+            loc_df.columns = ["Location", "Count"]
+            loc_fig = px.bar(loc_df, x="Location", y="Count", color="Location", title="Top 10 Predicted Locations")
+            st.plotly_chart(loc_fig, use_container_width=True)
 
 # ==========================
 # TAB 4 - MODEL PERFORMANCE
 # ==========================
 elif tabs == "Model Performance":
     st.title("🤖 Model Performance Metrics")
-
     st.write("""
     ### 🧠 Models Used
-    - **BERT Location Classifier** – Predicts likely article origin  
-    - **Isolation Forest** – Detects linguistic anomalies  
-    - **RoBERTa Sentiment Model** – Generates article polarity  
+    - **BERT Location Classifier** – Predicts likely article origin
+    - **Isolation Forest** – Detects linguistic anomalies
+    - **RoBERTa Sentiment Model** – Generates article polarity
 
     ### 📈 Evaluation Metrics
     | Metric | Value |
@@ -178,11 +294,6 @@ elif tabs == "Model Performance":
     | Precision | 0.72 |
     | Recall | 0.75 |
     | F1-Score | 0.73 |
-
-    ### 🧩 Model Insights
-    - The **BERT model** shows strong generalization on dominant regions like Pakistan and India.  
-    - **Linguistic anomalies** tend to correlate with articles showing mismatched sentiment and topic distribution.  
-    - **Source discrepancy** detection is consistent for multilingual articles.  
     """)
 
 # ==========================
@@ -190,25 +301,26 @@ elif tabs == "Model Performance":
 # ==========================
 elif tabs == "Read Articles":
     st.title("📰 Browse All Articles")
+    if df.empty:
+        st.info("No articles to show. Load processed_news.csv into the app folder.")
+    else:
+        selected_heading = st.selectbox("Select an Article to Read:", df["Heading"].dropna().unique())
+        selected_article = df[df["Heading"] == selected_heading].iloc[0]
 
-    selected_heading = st.selectbox("Select an Article to Read:", df["Heading"].dropna().unique())
-    selected_article = df[df["Heading"] == selected_heading].iloc[0]
-
-    st.subheader(selected_article["Heading"])
-    st.write(f"**Date:** {selected_article['Date']}")
-    st.write(f"**Type:** {selected_article['NewsType']}")
-    st.write(f"**Sentiment:** {selected_article['Sentiment']}")
-    st.write(f"**Location:** {selected_article['Predicted_Location_BERT']}")
-    st.write(f"**Anomaly Status:** {selected_article['AnomalyFlag']}")
-    st.markdown("---")
-    st.write(selected_article["Article"])
+        st.subheader(selected_article["Heading"])
+        st.write(f"**Date:** {selected_article.get('Date', '')}")
+        st.write(f"**Type:** {selected_article.get('NewsType', '')}")
+        st.write(f"**Sentiment:** {selected_article.get('Sentiment', '')}")
+        st.write(f"**Location:** {selected_article.get('Predicted_Location_BERT', '')}")
+        st.write(f"**Anomaly Status:** {selected_article.get('AnomalyFlag', '')}")
+        st.markdown("---")
+        st.write(selected_article.get("Article", ""))
 
 # ==========================
 # TAB 8 - USER INPUT PREDICTION (HUMAN-CENTRIC)
 # ==========================
 elif tabs == "User Input Prediction":
     st.title("🧠 User Input Based Prediction")
-
     st.markdown("Enter or paste a news article below to analyze if it’s an anomaly and detect potential bias:")
 
     # --- User Inputs ---
@@ -220,21 +332,8 @@ elif tabs == "User Input Prediction":
         if not article.strip():
             st.warning("Please enter the article content.")
         else:
-            import random
-            from datetime import datetime
-            from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-            from geotext import GeoText
-            import pandas as pd
-            import plotly.express as px
-            import plotly.graph_objects as go
-            import numpy as np
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.metrics.pairwise import cosine_similarity
-            import re
-
-            # --- Sentiment Analysis ---
-            analyzer = SentimentIntensityAnalyzer()
-            sentiment_score = analyzer.polarity_scores(article)["compound"]
+            # --- Sentiment Analysis (cached analyzer) ---
+            sentiment_score = sentiment_analyzer.polarity_scores(article)["compound"]
             if sentiment_score > 0.05:
                 sentiment = "Positive"
                 sentiment_icon = "😊"
@@ -245,119 +344,35 @@ elif tabs == "User Input Prediction":
                 sentiment = "Neutral"
                 sentiment_icon = "😐"
 
-            # --- Improved Location Detection (trusted keywords first, then GeoText) ---
+            # --- Location Detection (trusted keywords first) ---
             location = "Unknown"
-            trusted_locations = [
-                "Mumbai", "Delhi", "Bengaluru", "Chennai", "Kolkata",
-                "Hyderabad", "Pune", "Jaipur", "Ahmedabad", "Lucknow",
-                "Bhopal", "Chandigarh", "Patna", "Thiruvananthapuram",
-                "Assam", "Kerala", "Gujarat", "Rajasthan", "Tamil Nadu",
-                "Maharashtra", "Karnataka", "Uttar Pradesh", "Bihar",
-                "Pakistan", "Bangladesh", "Nepal", "Sri Lanka", "Bhutan",
-                "New York", "London", "Paris", "Tokyo", "Sydney"
-            ]
-            # match whole words case-insensitive
-            for city in trusted_locations:
+            for city in TRUSTED_LOCATIONS:
                 if re.search(rf'\b{re.escape(city)}\b', article, flags=re.IGNORECASE):
                     location = city
                     break
 
             # fallback to GeoText only if no trusted location found
             if location == "Unknown":
-                places = GeoText(article)
-                if places.cities:
-                    # choose the first valid city that is not a common word like "Police"
-                    for c in places.cities:
-                        if len(c) > 1 and not re.match(r'^[A-Z]{2,}$', c):  # simple sanity filter
-                            location = c
-                            break
+                try:
+                    places = GeoText(article)
+                    if places.cities:
+                        for c in places.cities:
+                            if len(c) > 1 and not re.match(r'^[A-Z]{2,}$', c):
+                                location = c
+                                break
+                except Exception:
+                    # GeoText can fail on some inputs - ignore safely
+                    location = "Unknown"
 
-            # --- UPDATED CATEGORY SYSTEM (Expanded keyword lists) ---
-            categories = {
-                "Politics": [
-                    "election", "vote", "minister", "government", "policy", "parliament",
-                    "senate", "assembly", "cabinet", "bill", "law", "democracy",
-                    "opposition", "campaign", "political party", "mp", "mla", "governor",
-                    "president", "pm", "chief minister", "government scheme", "public sector",
-                    "budget", "ordinance", "diplomacy", "international relations"
-                ],
-
-                "Education": [
-                    "school", "college", "university", "education", "students",
-                    "teacher", "principal", "examination", "result", "admission",
-                    "scholarship", "online classes", "syllabus", "textbook", "learning",
-                    "training program", "board exam", "academic", "research paper",
-                    "classroom", "attendance", "hostel", "campus", "lab", "coaching",
-                    "education policy", "skill development"
-                ],
-
-                "Health": [
-                    "health", "hospital", "doctor", "nurse", "patient", "disease",
-                    "virus", "infection", "vaccine", "clinic", "treatment", "surgery",
-                    "medicine", "healthcare", "diagnosis", "ambulance", "emergency",
-                    "mental health", "covid", "fever", "flu", "health department",
-                    "medical research", "public health", "health scheme"
-                ],
-
-                "Environment": [
-                    "environment", "pollution", "climate", "climate change", "global warming",
-                    "rainfall", "flood", "drought", "forest", "wildlife", "animals",
-                    "air quality", "water quality", "recycling", "waste management",
-                    "solar energy", "renewable energy", "disaster", "cyclone", "heatwave",
-                    "ozone", "ecosystem", "deforestation", "conservation"
-                ],
-
-                "Crime": [
-                    "crime", "police", "robbery", "murder", "theft", "fraud", "assault",
-                    "kidnap", "cybercrime", "accident", "victim", "court", "arrest",
-                    "investigation", "violence", "scam", "illegal", "narcotics",
-                    "juvenile", "forensic", "criminal", "fir", "chargesheet",
-                    "smuggling", "terrorism", "extortion"
-                ],
-
-                "Business": [
-                    "market", "stock", "company", "investment", "profit", "loss",
-                    "economy", "finance", "business", "industry", "startup", "shares",
-                    "ipo", "merger", "acquisition", "ceo", "revenue", "sales",
-                    "trade", "export", "import", "banking", "inflation", "commerce",
-                    "manufacturing", "small business", "corporate"
-                ],
-
-                "Technology": [
-                    "technology", "tech", "digital", "ai", "artificial intelligence",
-                    "machine learning", "deep learning", "neural network",
-                    "automation", "algorithm", "software", "app", "mobile", "computer",
-                    "robotics", "device", "smartphone", "innovation", "hardware",
-                    "processor", "chipset", "wearable", "semiconductor", "cloud",
-                    "cloud computing", "server", "data center", "database", "big data",
-                    "cyber", "cybersecurity", "data breach", "malware", "ransomware",
-                    "phishing", "encryption", "firewall", "iot", "5g", "network",
-                    "connectivity", "electric vehicle", "autonomous car",
-                    "self-driving", "startup", "research", "prototype", "engineering"
-                ],
-
-                "Sports": [
-                    "sports", "match", "game", "tournament", "league", "world cup",
-                    "team", "player", "stadium", "score", "goal", "cricket", "football",
-                    "basketball", "tennis", "badminton", "athlete", "coach",
-                    "championship", "training", "medal", "olympics", "injury",
-                    "referee", "umpire", "sports event"
-                ],
-
-                "General": [
-                    "public", "local", "event", "people", "society", "community",
-                    "festival", "celebration", "traffic", "weather", "update",
-                    "announcement", "information", "general news", "daily update"
-                ]
-            }
-
-            # Build category documents and compute TF-IDF similarity
-            category_docs = {cat: " ".join(words) for cat, words in categories.items()}
-            vectorizer = TfidfVectorizer(stop_words='english')
-            all_docs = list(category_docs.values()) + [article]
-            tfidf_matrix = vectorizer.fit_transform(all_docs)
-            similarities = cosine_similarity(tfidf_matrix[-1], tfidf_matrix[:-1])[0]
-            news_type = list(category_docs.keys())[similarities.argmax()]
+            # --- Category Prediction using prebuilt TF-IDF (fast) ---
+            from sklearn.metrics.pairwise import cosine_similarity as _cos_sim
+            # vectorize article using cached vectorizer
+            try:
+                art_vec = vectorizer.transform([article])
+                sims = _cos_sim(art_vec, category_tfidf_matrix)[0]
+                news_type = category_names[int(sims.argmax())]
+            except Exception:
+                news_type = "General"
 
             # --- Simulated Anomaly Detection ---
             anomaly_score = round(random.uniform(0, 1), 2)
@@ -423,9 +438,13 @@ elif tabs == "User Input Prediction":
 
             # --- Contextual Information ---
             st.markdown("### 📚 Contextual Information")
+            # simple keyword extraction using vectorizer stop words to filter
+            try:
+                stopwords = set(vectorizer.get_stop_words())
+            except Exception:
+                stopwords = set()
             words = re.findall(r'\b\w+\b', article.lower())
-            stopwords = set(vectorizer.get_stop_words())
-            keywords = [w for w in words if w not in stopwords]
+            keywords = [w for w in words if w not in stopwords and len(w) > 2]
             keyword_freq = pd.Series(keywords).value_counts().head(5)
             st.write("**Top Keywords:**", ", ".join(keyword_freq.index.tolist()))
             st.write("**Detected Location/Entities:**", location)
@@ -447,7 +466,7 @@ elif tabs == "User Input Prediction":
             for flag in bias_flags:
                 st.warning(flag)
 
-            # --- Save Results ---
+            # --- Save Results (append to CSV) ---
             log_df_new = pd.DataFrame([{
                 "Datetime": datetime.now(),
                 "Headline": heading,
